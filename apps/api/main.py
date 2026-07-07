@@ -36,7 +36,6 @@ BASE_REPLICAS = int(os.getenv("BASE_REPLICAS", "1"))
 SURGE_REPLICAS = int(os.getenv("SURGE_REPLICAS", "6"))
 HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "10"))
 PEER_API_BASE = os.getenv("PEER_API_BASE", "http://bot-02.woonyong.org").rstrip("/")
-MAX_TRAFFIC_TPS = int(os.getenv("MAX_TRAFFIC_TPS", "0"))
 SENDER_CAPACITY_PER_POD = int(os.getenv("SENDER_CAPACITY_PER_POD", "1500"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
