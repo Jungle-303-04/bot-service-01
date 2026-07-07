@@ -74,6 +74,8 @@ traffic_task: asyncio.Task[Any] | None = None
 traffic_state: dict[str, Any] = {
     "role": "sender",
     "running": False,
+    "generation": 0,
+    "run_id": "",
     "mode": "manual",
     "target_tps": 0,
     "manual_replicas": BASE_REPLICAS,
@@ -282,6 +284,7 @@ def decode_payload(value: Any) -> dict[str, Any]:
 
 
 async def save_traffic_runtime(payload: dict[str, Any]) -> None:
+    generation = int(payload.get("generation") or 0)
     await exec_db(
         "traffic_runtime",
         """
@@ -289,8 +292,10 @@ async def save_traffic_runtime(payload: dict[str, Any]) -> None:
         VALUES('traffic', $1::jsonb, now())
         ON CONFLICT (key)
         DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+        WHERE COALESCE((traffic_runtime.payload->>'generation')::bigint, 0) <= $2
         """,
         json_arg(payload),
+        generation,
     )
 
 
@@ -811,6 +816,17 @@ async def ensure_sender_from_runtime(scenarios: dict[str, bool]) -> None:
         track(traffic_task)
 
 
+async def stop_peer_receiver(run_id: str, generation: int) -> None:
+    async with traffic_lock:
+        still_current = int(traffic_state.get("generation") or 0) == generation and not traffic_state.get("running")
+    if not still_current:
+        return
+    try:
+        await peer_post("/api/traffic/receiver/stop", {"run_id": run_id})
+    except RuntimeError:
+        ERRORS.labels(SERVICE_NAME, "peer_stop_failed").inc()
+
+
 async def traffic_runtime_watcher() -> None:
     while True:
         try:
@@ -1169,6 +1185,7 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
         scale_error = str(exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    run_id = f"{SERVICE_NAME}-{time.time_ns()}"
     try:
         peer_state = await peer_post(
             "/api/traffic/receiver/start",
@@ -1177,6 +1194,7 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
                 "mode": mode,
                 "manual_replicas": BASE_REPLICAS,
                 "source": "sender",
+                "run_id": run_id,
             },
         )
     except RuntimeError as exc:
@@ -1186,8 +1204,11 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
 
     started_at = utc_now()
     async with traffic_lock:
+        generation = int(traffic_state.get("generation") or 0) + 1
         traffic_state.update({
             "running": True,
+            "generation": generation,
+            "run_id": run_id,
             "mode": mode,
             "target_tps": target_tps,
             "manual_replicas": manual_replicas,
@@ -1224,10 +1245,12 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
 @app.post("/api/traffic/stop")
 async def stop_link_traffic() -> dict[str, Any]:
     global traffic_task
-    await set_scenario("traffic_link", False)
     async with traffic_lock:
+        generation = int(traffic_state.get("generation") or 0) + 1
+        run_id = str(traffic_state.get("run_id") or "")
         traffic_state.update({
             "running": False,
+            "generation": generation,
             "target_tps": 0,
             "queue_depth": 0.0,
             "peer_queue_depth": 0.0,
@@ -1246,11 +1269,20 @@ async def stop_link_traffic() -> dict[str, Any]:
             await asyncio.wait_for(task, timeout=0.5)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+    async with traffic_lock:
+        still_current = int(traffic_state.get("generation") or 0) == generation and not traffic_state.get("running")
+    if not still_current:
+        return {
+            "scenario": "traffic_link",
+            "status": "stale_stop_ignored",
+            "target_tps": 0,
+            "target_replicas": int(traffic_state.get("desired_replicas") or BASE_REPLICAS),
+            "observed_replicas": int(traffic_state.get("desired_replicas") or BASE_REPLICAS),
+            "peer_error": None,
+        }
+    await set_scenario("traffic_link", False)
     peer_error = None
-    try:
-        await peer_post("/api/traffic/receiver/stop", {})
-    except RuntimeError as exc:
-        peer_error = str(exc)
+    track(asyncio.create_task(stop_peer_receiver(run_id, generation)))
     try:
         await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
         scale = await scale_api_deployment(BASE_REPLICAS)
