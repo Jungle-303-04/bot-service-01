@@ -208,21 +208,48 @@ export default function App() {
   const [manualReplicas, setManualReplicas] = useState(1);
   const [mode, setMode] = useState<'manual' | 'auto'>('manual');
   const [busy, setBusy] = useState('');
+  const mountedRef = useRef(true);
+  const refreshInFlightRef = useRef(false);
+  const refreshQueuedRef = useRef(false);
 
   const refresh = async () => {
-    const next = await api<Status>('/api/status');
-    setStatus(next);
-    if (next.traffic.running) {
-      setMode(next.traffic.mode ?? 'manual');
-      setManualReplicas(next.traffic.manual_replicas || 1);
-      if (next.traffic.target_tps > 0) setTargetTps(next.traffic.target_tps);
+    if (refreshInFlightRef.current) {
+      refreshQueuedRef.current = true;
+      return;
+    }
+    refreshInFlightRef.current = true;
+    try {
+      const next = await api<Status>('/api/status');
+      if (!mountedRef.current) return;
+      setStatus(next);
+      if (next.traffic.running) {
+        setMode(next.traffic.mode ?? 'manual');
+        setManualReplicas(next.traffic.manual_replicas || 1);
+        if (next.traffic.target_tps > 0) setTargetTps(next.traffic.target_tps);
+      }
+    } finally {
+      refreshInFlightRef.current = false;
+      if (refreshQueuedRef.current && mountedRef.current) {
+        refreshQueuedRef.current = false;
+        void refresh().catch(() => undefined);
+      }
     }
   };
 
   useEffect(() => {
-    void refresh();
-    const id = window.setInterval(() => { void refresh().catch(() => undefined); }, 250);
-    return () => window.clearInterval(id);
+    mountedRef.current = true;
+    let timer = 0;
+    let cancelled = false;
+    const loop = async () => {
+      await refresh().catch(() => undefined);
+      if (!cancelled) timer = window.setTimeout(loop, 320);
+    };
+    void loop();
+    return () => {
+      cancelled = true;
+      mountedRef.current = false;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   const traffic = status?.traffic;
@@ -273,7 +300,7 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ target_tps: targetTps, mode, manual_replicas: manualReplicas }),
       });
-      await refresh();
+      void refresh().catch(() => undefined);
     } finally {
       setBusy('');
     }
@@ -303,7 +330,7 @@ export default function App() {
         },
       } : current);
       await api('/api/traffic/stop', { method: 'POST' });
-      await refresh();
+      void refresh().catch(() => undefined);
     } finally {
       setBusy('');
     }

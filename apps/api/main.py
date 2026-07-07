@@ -70,6 +70,8 @@ scenario_state: dict[str, bool] = {
 background_tasks: set[asyncio.Task[Any]] = set()
 last_scenario_sync = 0.0
 traffic_lock = asyncio.Lock()
+row_gauge_cache: tuple[float, dict[str, int]] = (0.0, {})
+cluster_cache: tuple[float, dict[str, Any]] = (0.0, {})
 traffic_task: asyncio.Task[Any] | None = None
 traffic_state: dict[str, Any] = {
     "role": "sender",
@@ -202,6 +204,11 @@ async def init_schema() -> None:
               payload JSONB NOT NULL,
               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_event_created_at
+              ON audit_logs(event_type, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_pod_created_at
+              ON audit_logs((payload->>'pod'), created_at DESC)
+              WHERE payload ? 'pod';
             """
         )
         await conn.execute(
@@ -240,6 +247,17 @@ async def refresh_row_gauges() -> dict[str, int]:
             count = int(await conn.fetchval(f"SELECT count(*) FROM {table}"))
             counts[table] = count
             ROWS_TOTAL.labels(SERVICE_NAME, table).set(count)
+    return counts
+
+
+async def cached_row_gauges(ttl_seconds: float = 2.0) -> dict[str, int]:
+    global row_gauge_cache
+    now = time.monotonic()
+    cached_at, counts = row_gauge_cache
+    if counts and now - cached_at < ttl_seconds:
+        return dict(counts)
+    counts = await refresh_row_gauges()
+    row_gauge_cache = (now, dict(counts))
     return counts
 
 
@@ -502,24 +520,41 @@ async def cluster_snapshot() -> dict[str, Any]:
         return {**base, "error": str(exc)}
 
 
+async def cached_cluster_snapshot(ttl_seconds: float = 0.45) -> dict[str, Any]:
+    global cluster_cache
+    now = time.monotonic()
+    cached_at, cluster = cluster_cache
+    if cluster and now - cached_at < ttl_seconds:
+        return dict(cluster)
+    cluster = await cluster_snapshot()
+    cluster_cache = (now, dict(cluster))
+    return cluster
+
+
 async def scale_api_deployment(replicas: int) -> dict[str, Any]:
+    global cluster_cache
     if not kube_available():
         raise RuntimeError("Kubernetes service account is not available")
-    return await kube_json(
+    scale = await kube_json(
         "PATCH",
         f"/apis/apps/v1/namespaces/{KUBE_NAMESPACE}/deployments/{DEPLOYMENT_NAME}/scale",
         {"spec": {"replicas": replicas}},
     )
+    cluster_cache = (0.0, {})
+    return scale
 
 
 async def patch_hpa_bounds(min_replicas: int, max_replicas: int) -> dict[str, Any] | None:
+    global cluster_cache
     if not kube_available():
         raise RuntimeError("Kubernetes service account is not available")
-    return await kube_json(
+    hpa = await kube_json(
         "PATCH",
         f"/apis/autoscaling/v2/namespaces/{KUBE_NAMESPACE}/horizontalpodautoscalers/{DEPLOYMENT_NAME}",
         {"spec": {"minReplicas": min_replicas, "maxReplicas": max_replicas}},
     )
+    cluster_cache = (0.0, {})
+    return hpa
 
 
 async def patch_release(version: str, flavor: str) -> dict[str, Any]:
@@ -612,7 +647,7 @@ async def peer_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def traffic_cluster_refresh() -> None:
-    cluster = await cluster_snapshot()
+    cluster = await cached_cluster_snapshot()
     async with traffic_lock:
         traffic_state["ready_replicas"] = max(1, int(cluster.get("ready_replicas") or cluster.get("desired_replicas") or BASE_REPLICAS))
         traffic_state["desired_replicas"] = max(1, int(cluster.get("desired_replicas") or traffic_state["ready_replicas"]))
@@ -991,7 +1026,7 @@ async def status(response: Response) -> dict[str, Any]:
                     "updated_at": utc_now(),
                 })
                 await save_traffic_runtime(dict(traffic_state))
-    counts, cluster = await asyncio.gather(refresh_row_gauges(), cluster_snapshot())
+    counts, cluster = await asyncio.gather(cached_row_gauges(), cached_cluster_snapshot())
     traffic = await traffic_snapshot(cluster)
     samples = list(latency_samples)
     p95 = sorted(samples)[int(len(samples) * 0.95) - 1] if samples else 0
