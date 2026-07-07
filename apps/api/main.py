@@ -565,7 +565,7 @@ def target_replicas_for_mode(target_tps: int, mode: str, manual_replicas: int) -
 
 async def apply_traffic_replicas(target_tps: int, mode: str, manual_replicas: int) -> dict[str, Any]:
     target_replicas = target_replicas_for_mode(target_tps, mode, manual_replicas)
-    hpa_max = max(target_replicas, HPA_MAX_REPLICAS)
+    hpa_max = target_replicas if mode == "manual" else max(target_replicas, HPA_MAX_REPLICAS)
     await patch_hpa_bounds(target_replicas, hpa_max)
     scale = await scale_api_deployment(target_replicas)
     return {
@@ -943,7 +943,19 @@ async def metrics() -> Response:
 @app.get("/api/status")
 async def status() -> dict[str, Any]:
     scenarios = await sync_scenarios_from_db(force=True)
-    await ensure_sender_from_runtime(scenarios)
+    if scenarios.get("traffic_link", False):
+        await ensure_sender_from_runtime(scenarios)
+    else:
+        async with traffic_lock:
+            if traffic_state["running"] or traffic_state["target_tps"] or traffic_state["queue_depth"]:
+                traffic_state.update({
+                    "running": False,
+                    "target_tps": 0,
+                    "queue_depth": 0.0,
+                    "peer_queue_depth": 0.0,
+                    "updated_at": utc_now(),
+                })
+                await save_traffic_runtime(dict(traffic_state))
     counts, cluster = await asyncio.gather(refresh_row_gauges(), cluster_snapshot())
     traffic = await traffic_snapshot(cluster)
     samples = list(latency_samples)
@@ -1192,6 +1204,7 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
 
 @app.post("/api/traffic/stop")
 async def stop_link_traffic() -> dict[str, Any]:
+    await set_scenario("traffic_link", False)
     async with traffic_lock:
         traffic_state.update({
             "running": False,
@@ -1214,7 +1227,6 @@ async def stop_link_traffic() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     await set_scenario("scale_surge", False)
     await set_scenario("load", False)
-    await set_scenario("traffic_link", False)
     return {
         "scenario": "traffic_link",
         "status": "stopped",
