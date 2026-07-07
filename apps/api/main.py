@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -39,6 +40,14 @@ PEER_API_BASE = os.getenv("PEER_API_BASE", "http://bot-02.woonyong.org").rstrip(
 SENDER_CAPACITY_PER_POD = int(os.getenv("SENDER_CAPACITY_PER_POD", "1500"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+
+def stable_pod_factor(seed: str, low: float, span: float) -> float:
+    bucket = int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16) % 1000
+    return low + (bucket / 999) * span
+
+
+POD_TRAFFIC_FACTOR = stable_pod_factor(POD_NAME, 0.78, 0.44)
 
 REQUESTS = Counter("bot_service_http_requests_total", "HTTP requests", ["service", "path", "method", "status"])
 LATENCY = Histogram("bot_service_http_request_duration_seconds", "HTTP request latency", ["service", "path"])
@@ -658,7 +667,7 @@ async def sender_loop() -> None:
             elapsed = max(0.05, now - float(traffic_state["last_tick"]))
             traffic_state["last_tick"] = now
             workers = max(1, int(traffic_state["desired_replicas"]))
-            produced = float(traffic_state["target_tps"]) * elapsed / workers
+            produced = float(traffic_state["target_tps"]) * elapsed / workers * POD_TRAFFIC_FACTOR
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) + produced)
             send_capacity = SENDER_CAPACITY_PER_POD * elapsed
             tick_limit = max(1000, HPA_MAX_REPLICAS * SENDER_CAPACITY_PER_POD)
@@ -721,9 +730,9 @@ async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
                   COALESCE(SUM((payload->>'units')::bigint), 0) AS sent_total,
                   COALESCE(SUM((payload->>'accepted')::bigint), 0) AS accepted_total,
                   COALESCE(SUM((payload->>'failed')::bigint), 0) AS failed_total,
-                  COALESCE(SUM((payload->>'units')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS sent_per_second,
-                  COALESCE(SUM((payload->>'accepted')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS accepted_per_second,
-                  COALESCE(SUM((payload->>'failed')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS failed_per_second
+                  COALESCE(ROUND(SUM((payload->>'units')::bigint) FILTER (WHERE created_at >= now() - interval '2 seconds') / 2.0), 0) AS sent_per_second,
+                  COALESCE(ROUND(SUM((payload->>'accepted')::bigint) FILTER (WHERE created_at >= now() - interval '2 seconds') / 2.0), 0) AS accepted_per_second,
+                  COALESCE(ROUND(SUM((payload->>'failed')::bigint) FILTER (WHERE created_at >= now() - interval '2 seconds') / 2.0), 0) AS failed_per_second
                 FROM audit_logs
                 WHERE event_type = 'traffic.link.sent'
                   AND created_at >= $1
@@ -736,14 +745,13 @@ async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
         sent_per_second = int(row["sent_per_second"] or 0) if row else 0
         accepted_per_second = int(row["accepted_per_second"] or 0) if row else 0
         failed_per_second = int(row["failed_per_second"] or 0) if row else 0
-        produced = int(state.get("target_tps") or 0) * max(0.0, (datetime.now(UTC) - started_at).total_seconds())
         pod_rows = await timed_db(
             "traffic_link_pods",
             """
             SELECT
               payload->>'pod' AS pod,
-              COALESCE(SUM((payload->>'units')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS sent_per_second,
-              COALESCE(SUM((payload->>'accepted')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS accepted_per_second,
+              COALESCE(ROUND(SUM((payload->>'units')::bigint) FILTER (WHERE created_at >= now() - interval '2 seconds') / 2.0), 0) AS sent_per_second,
+              COALESCE(ROUND(SUM((payload->>'accepted')::bigint) FILTER (WHERE created_at >= now() - interval '2 seconds') / 2.0), 0) AS accepted_per_second,
               COALESCE(MAX((payload->>'queue_depth')::double precision), 0) AS queue_depth
             FROM audit_logs
             WHERE event_type = 'traffic.link.sent'
@@ -768,7 +776,10 @@ async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
         state["accepted_per_second"] = accepted_per_second
         state["failed_per_second"] = failed_per_second
         state["pod_stats"] = pod_stats
-        state["queue_depth"] = max(float(state.get("queue_depth") or 0), produced - sent_total)
+        if pod_stats:
+            state["queue_depth"] = sum(float(item["queue_depth"]) for item in pod_stats.values())
+        else:
+            state["queue_depth"] = 0.0
     else:
         state["sent_per_second"] = 0
         state["accepted_per_second"] = 0
