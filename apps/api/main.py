@@ -594,7 +594,8 @@ async def sender_loop() -> None:
             produced = float(traffic_state["target_tps"]) * elapsed
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) + produced)
             send_capacity = ready * SENDER_CAPACITY_PER_POD * elapsed
-            send_units = int(min(float(traffic_state["queue_depth"]), send_capacity, 2000))
+            tick_limit = max(1000, HPA_MAX_REPLICAS * SENDER_CAPACITY_PER_POD)
+            send_units = int(min(float(traffic_state["queue_depth"]), send_capacity, tick_limit))
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) - send_units)
             target_tps = int(traffic_state["target_tps"])
 
