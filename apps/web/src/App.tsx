@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 
 interface Pod {
   name: string;
@@ -8,8 +8,6 @@ interface Pod {
 interface Cluster {
   desired_replicas: number;
   ready_replicas: number;
-  template_version: string;
-  rollout_complete: boolean;
   pods: Pod[];
   hpa?: {
     min_replicas?: number;
@@ -17,17 +15,29 @@ interface Cluster {
   };
 }
 
-interface Status {
-  version: string;
-  scenarios: Record<string, boolean>;
-  metrics: { p95_latency_ms: number };
-  rows: Record<string, number>;
-  cluster: Cluster;
+interface Traffic {
+  running: boolean;
+  mode: 'manual' | 'auto';
+  target_tps: number;
+  manual_replicas: number;
+  ready_replicas: number;
+  desired_replicas: number;
+  queue_depth: number;
+  sent_total: number;
+  accepted_total: number;
+  failed_total: number;
+  peer_queue_depth: number;
+  peer_ready_replicas: number;
+  peer_desired_replicas: number;
+  pressure: number;
+  capacity_per_second: number;
 }
 
-interface WorkResult {
-  success: number;
-  failure: number;
+interface Status {
+  version: string;
+  metrics: { p95_latency_ms: number };
+  cluster: Cluster;
+  traffic: Traffic;
 }
 
 interface PodBox {
@@ -50,7 +60,7 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function formatCount(value: number) {
-  return Math.round(value).toLocaleString('ko-KR');
+  return Math.round(value || 0).toLocaleString('ko-KR');
 }
 
 function shortPodName(name: string) {
@@ -60,303 +70,159 @@ function shortPodName(name: string) {
 function splitBoxes(items: Array<{ name: string; ready: boolean }>, x = 0, y = 0, w = 1, h = 1): PodBox[] {
   if (items.length === 0) return [];
   if (items.length === 1) return [{ ...items[0], x, y, w, h }];
-
   const firstCount = Math.ceil(items.length / 2);
   const first = items.slice(0, firstCount);
   const second = items.slice(firstCount);
   const ratio = first.length / items.length;
-
   if (w >= h) {
     const w1 = w * ratio;
     return [...splitBoxes(first, x, y, w1, h), ...splitBoxes(second, x + w1, y, w - w1, h)];
   }
-
   const h1 = h * ratio;
   return [...splitBoxes(first, x, y, w, h1), ...splitBoxes(second, x, y + h1, w, h - h1)];
 }
 
-function heatColor(heat: number, pulse: number) {
-  const value = clamp(heat + pulse * 0.08, 0, 1);
-  if (value < 0.5) {
-    const r = value / 0.5;
-    return `rgb(${Math.round(99 + 150 * r)}, ${Math.round(205 + 13 * r)}, ${Math.round(170 - 61 * r)})`;
-  }
-  const r = (value - 0.5) / 0.5;
-  return `rgb(${Math.round(249 - 7 * r)}, ${Math.round(218 - 98 * r)}, ${Math.round(109 + 19 * r)})`;
+function heatClass(pressure: number, ready: boolean) {
+  if (!ready) return 'idle';
+  if (pressure >= 0.72) return 'bad';
+  if (pressure >= 0.35) return 'warn';
+  return 'good';
 }
 
-function failureRateFor(perPodTps: number) {
-  return clamp((perPodTps - 850) / 2400, 0.02, 0.52);
+function tileStyle(box: PodBox, pressure: number) {
+  return {
+    left: `${box.x * 100}%`,
+    top: `${box.y * 100}%`,
+    width: `${box.w * 100}%`,
+    height: `${box.h * 100}%`,
+    '--heat': `${Math.round(clamp(pressure, 0, 1) * 100)}%`,
+  } as CSSProperties;
 }
 
 export default function App() {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const statusRef = useRef<Status | null>(null);
-  const runningRef = useRef(false);
-  const targetTpsRef = useRef(1000);
-  const trafficTimer = useRef<number | null>(null);
-  const scaleTimer = useRef<number | null>(null);
-
   const [status, setStatus] = useState<Status | null>(null);
   const [targetTps, setTargetTps] = useState(1000);
-  const [running, setRunning] = useState(false);
+  const [manualReplicas, setManualReplicas] = useState(1);
+  const [mode, setMode] = useState<'manual' | 'auto'>('manual');
   const [busy, setBusy] = useState('');
-  const [success, setSuccess] = useState(0);
-  const [failure, setFailure] = useState(0);
-  const [notice, setNotice] = useState('대기 중');
 
   const refresh = async () => {
-    try {
-      const next = await api<Status>('/api/status');
-      statusRef.current = next;
-      setStatus(next);
-      setNotice((current) => (current === '상태 조회 재시도 중' ? (runningRef.current ? '트래픽 실행 중' : '대기 중') : current));
-    } catch {
-      setNotice('상태 조회 재시도 중');
+    const next = await api<Status>('/api/status');
+    setStatus(next);
+    if (next.traffic.running && !busy) {
+      setMode(next.traffic.mode ?? 'manual');
+      setManualReplicas(next.traffic.manual_replicas || 1);
+      if (next.traffic.target_tps > 0) setTargetTps(next.traffic.target_tps);
     }
   };
 
   useEffect(() => {
     void refresh();
-    const id = window.setInterval(() => { void refresh(); }, 1000);
+    const id = window.setInterval(() => { void refresh().catch(() => undefined); }, 1000);
     return () => window.clearInterval(id);
   }, []);
 
-  useEffect(() => {
-    runningRef.current = running;
-  }, [running]);
+  const traffic = status?.traffic;
+  const cluster = status?.cluster;
+  const running = Boolean(traffic?.running);
+  const ready = cluster?.ready_replicas ?? traffic?.ready_replicas ?? 0;
+  const desired = cluster?.desired_replicas ?? traffic?.desired_replicas ?? 0;
+  const pressure = traffic?.pressure ?? 0;
+  const p95 = status?.metrics.p95_latency_ms ?? 0;
+  const peerPods = `${traffic?.peer_ready_replicas ?? 0} / ${traffic?.peer_desired_replicas ?? 0}`;
 
-  useEffect(() => {
-    targetTpsRef.current = targetTps;
-  }, [targetTps]);
+  const pods = useMemo(() => {
+    const actual = cluster?.pods ?? [];
+    const count = Math.max(cluster?.desired_replicas ?? 1, actual.length, 1);
+    return Array.from({ length: count }, (_, index) => {
+      const pod = actual[index];
+      return { name: pod ? shortPodName(pod.name) : `pending-${index + 1}`, ready: Boolean(pod?.ready) };
+    });
+  }, [cluster]);
 
-  useEffect(() => {
-    let raf = 0;
-
-    const draw = (time: number) => {
-      const canvas = canvasRef.current;
-      if (!canvas) {
-        raf = requestAnimationFrame(draw);
-        return;
-      }
-
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const width = Math.max(1, Math.floor(rect.width * dpr));
-      const height = Math.max(1, Math.floor(rect.height * dpr));
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width;
-        canvas.height = height;
-      }
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, rect.width, rect.height);
-      ctx.fillStyle = '#f1f6fb';
-      ctx.fillRect(0, 0, rect.width, rect.height);
-
-      const current = statusRef.current;
-      const pods = current?.cluster.pods ?? [];
-      const desired = Math.max(current?.cluster.desired_replicas ?? 1, pods.length, 1);
-      const models = Array.from({ length: desired }, (_, index) => {
-        const pod = pods[index];
-        return { name: pod ? shortPodName(pod.name) : `생성 중 ${index + 1}`, ready: Boolean(pod?.ready) };
-      });
-      const boxes = splitBoxes(models);
-      const perPodTps = runningRef.current ? targetTpsRef.current / Math.max(desired, 1) : 0;
-      const baseHeat = clamp(perPodTps / 1200, 0.05, 1);
-
-      boxes.forEach((box, podIndex) => {
-        const x = box.x * rect.width + 5;
-        const y = box.y * rect.height + 5;
-        const w = box.w * rect.width - 10;
-        const h = box.h * rect.height - 10;
-        const cells = runningRef.current ? clamp(Math.ceil(perPodTps / 10), 6, 1000) : 1;
-        const cols = Math.ceil(Math.sqrt(cells * (w / Math.max(h, 1))));
-        const rows = Math.ceil(cells / cols);
-        const cw = w / cols;
-        const ch = h / rows;
-
-        ctx.save();
-        ctx.beginPath();
-        ctx.roundRect(x, y, w, h, 8);
-        ctx.clip();
-
-        for (let i = 0; i < cells; i += 1) {
-          const col = i % cols;
-          const row = Math.floor(i / cols);
-          const wave = Math.sin(time / 220 + i * 0.7 + podIndex) * 0.5 + 0.5;
-          const localHeat = clamp(baseHeat * (0.78 + wave * 0.34), 0.03, 1);
-          const gx = x + col * cw;
-          const gy = y + row * ch;
-          const grad = ctx.createLinearGradient(gx, gy, gx + cw, gy + ch);
-          grad.addColorStop(0, heatColor(localHeat * 0.82, wave * 0.3));
-          grad.addColorStop(1, heatColor(localHeat, wave));
-          ctx.fillStyle = box.ready ? grad : 'rgba(249, 181, 98, .66)';
-          ctx.fillRect(gx, gy, Math.ceil(cw) + 1, Math.ceil(ch) + 1);
-        }
-
-        ctx.fillStyle = 'rgba(255,255,255,.82)';
-        ctx.fillRect(x, y, w, 78);
-        ctx.strokeStyle = box.ready ? 'rgba(74, 151, 196, .55)' : 'rgba(249, 181, 98, .68)';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
-        const labelSize = clamp(w / 13, 11, 16);
-        const stateSize = clamp(w / 8, 16, 28);
-        ctx.fillStyle = '#30415f';
-        ctx.font = `900 ${labelSize}px system-ui, sans-serif`;
-        ctx.fillText(box.name, x + 14, y + 26);
-        ctx.font = `900 ${stateSize}px system-ui, sans-serif`;
-        ctx.fillText(box.ready ? 'Ready' : 'Pending', x + 14, y + 58);
-        ctx.font = '800 12px system-ui, sans-serif';
-        ctx.fillStyle = '#7890aa';
-        ctx.fillText(`${formatCount(perPodTps)} TPS / pod`, x + 14, y + 74);
-        ctx.restore();
-      });
-
-      raf = requestAnimationFrame(draw);
-    };
-
-    raf = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(raf);
-  }, []);
-
-  useEffect(() => {
-    if (trafficTimer.current) window.clearInterval(trafficTimer.current);
-    if (!running) return;
-
-    trafficTimer.current = window.setInterval(() => {
-      const current = statusRef.current;
-      const pods = Math.max(current?.cluster.ready_replicas ?? current?.cluster.desired_replicas ?? 1, 1);
-      const perPodTps = targetTpsRef.current / pods;
-      const unitsPerTick = Math.max(1, Math.round(targetTpsRef.current / 5));
-      const chunks = Array.from({ length: Math.ceil(unitsPerTick / 1000) }, (_, index) => Math.min(1000, unitsPerTick - index * 1000));
-      const failureRate = failureRateFor(perPodTps);
-
-      void Promise.allSettled(chunks.map((units, index) => api<WorkResult>('/api/work', {
-        method: 'POST',
-        body: JSON.stringify({ bot_id: `checkout-bot-${index + 1}`, units, failure_rate: failureRate }),
-      }))).then((results) => {
-        let ok = 0;
-        let bad = 0;
-        results.forEach((result) => {
-          if (result.status === 'fulfilled') {
-            ok += result.value.success;
-            bad += result.value.failure;
-          } else {
-            bad += Math.max(1, Math.round(unitsPerTick / chunks.length));
-          }
-        });
-        setSuccess((value) => value + ok);
-        setFailure((value) => value + bad);
-      });
-    }, 200);
-
-    return () => {
-      if (trafficTimer.current) window.clearInterval(trafficTimer.current);
-    };
-  }, [running]);
-
-  useEffect(() => {
-    if (!running) return;
-    if (scaleTimer.current) window.clearTimeout(scaleTimer.current);
-    scaleTimer.current = window.setTimeout(() => {
-      void api('/api/scenarios/traffic/start', {
-        method: 'POST',
-        body: JSON.stringify({ target_tps: targetTps }),
-      }).then(refresh).catch(() => setNotice('파드 조정 재시도 중'));
-    }, 350);
-    return () => {
-      if (scaleTimer.current) window.clearTimeout(scaleTimer.current);
-    };
-  }, [running, targetTps]);
+  const boxes = useMemo(() => splitBoxes(pods), [pods]);
+  const perPodSent = (traffic?.sent_total ?? 0) / Math.max(ready || desired || 1, 1);
+  const perPodQueue = (traffic?.queue_depth ?? 0) / Math.max(ready || desired || 1, 1);
 
   const start = async () => {
-    setBusy('실행');
-    setSuccess(0);
-    setFailure(0);
-    setRunning(true);
-    setNotice('트래픽 실행 중');
+    setBusy('start');
     try {
-      await api('/api/scenarios/traffic/start', {
+      await api('/api/traffic/start', {
         method: 'POST',
-        body: JSON.stringify({ target_tps: targetTps }),
+        body: JSON.stringify({ target_tps: targetTps, mode, manual_replicas: manualReplicas }),
       });
       await refresh();
-    } catch {
-      setNotice('실행 재시도 필요');
-      setRunning(false);
     } finally {
       setBusy('');
     }
   };
 
   const stop = async () => {
-    setBusy('중지');
-    setRunning(false);
-    setNotice('중지 중');
+    setBusy('stop');
     try {
-      await api('/api/scenarios/traffic/stop', { method: 'POST' });
-      setNotice('중지됨');
+      await api('/api/traffic/stop', { method: 'POST' });
       await refresh();
-    } catch {
-      setNotice('중지 재시도 필요');
     } finally {
       setBusy('');
     }
   };
 
-  const ready = status?.cluster.ready_replicas ?? 0;
-  const desired = status?.cluster.desired_replicas ?? 0;
-  const p95 = status?.metrics.p95_latency_ms ?? 0;
-  const perPodTps = running ? targetTps / Math.max(ready || desired || 1, 1) : 0;
-  const failRate = success + failure ? Math.round((failure / (success + failure)) * 100) : 0;
-
   return (
     <main className="shell">
       <section className="hero">
         <div>
-          <p>bot-service-01 · 자동 파드 증감</p>
-          <h1>TPS 파드 히트맵</h1>
+          <p>bot-service-01 · 송신</p>
+          <h1>송신 플릿 맵</h1>
         </div>
         <strong className={`badge ${running ? 'warn' : 'ok'}`}>{running ? '실행 중' : '대기'}</strong>
       </section>
 
       <section className="control-panel" aria-label="트래픽 제어">
+        <div className="segmented" aria-label="모드">
+          <button className={mode === 'manual' ? 'active' : ''} onClick={() => setMode('manual')} disabled={running || !!busy}>수동</button>
+          <button className={mode === 'auto' ? 'active' : ''} onClick={() => setMode('auto')} disabled={running || !!busy}>자동</button>
+        </div>
         <label>
           <span>목표 TPS</span>
-          <input type="number" min={1} max={10000} value={targetTps} onChange={(event) => setTargetTps(clamp(Number(event.target.value), 1, 10000))} />
+          <input type="number" min={1} max={10000} value={targetTps} onChange={(event) => setTargetTps(clamp(Number(event.target.value), 1, 10000))} disabled={running} />
         </label>
-        <button className="primary" onClick={start} disabled={!!busy || running}>실행</button>
-        <button onClick={stop} disabled={!!busy || !running}>중지</button>
-      </section>
-
-      <section className="definition">
-        <strong>기준</strong>
-        <span>블록 1개는 실제 Kubernetes 파드 1개입니다. 01은 TPS 변경에 따라 파드가 자동으로 늘고 줄어듭니다. 색은 파드당 TPS 열감이며 초록에서 노랑, 빨강으로 뜨거워집니다.</span>
+        <label>
+          <span>기준 Pod</span>
+          <input type="number" min={1} max={10} value={manualReplicas} onChange={(event) => setManualReplicas(clamp(Number(event.target.value), 1, 10))} disabled={running || mode === 'auto'} />
+        </label>
+        <button className="primary" onClick={start} disabled={running || !!busy}>실행</button>
+        <button onClick={stop} disabled={!running || !!busy}>중지</button>
       </section>
 
       <section className="metrics">
-        <Metric label="목표 TPS" value={formatCount(targetTps)} />
-        <Metric label="파드" value={`${ready} / ${desired}`} />
-        <Metric label="파드당 TPS" value={formatCount(perPodTps)} />
-        <Metric label="실패율" value={`${failRate}%`} tone={failRate > 12 ? 'bad' : failRate > 0 ? 'warn' : 'ok'} />
+        <Metric label="보낸 수" value={formatCount(traffic?.sent_total ?? 0)} />
+        <Metric label="송신 큐" value={formatCount(traffic?.queue_depth ?? 0)} tone={pressure > 0.72 ? 'bad' : pressure > 0.35 ? 'warn' : 'ok'} />
+        <Metric label="송신 Pod" value={`${ready} / ${desired}`} />
+        <Metric label="수신 Pod" value={peerPods} />
       </section>
 
-      <section className="traffic-card">
-        <div className="traffic-title">
+      <section className="map-card">
+        <div className="map-title">
           <div>
-            <strong>60fps 파드 히트맵</strong>
-            <span>{notice} · 성공 {formatCount(success)} · 실패 {formatCount(failure)} · p95 {Math.round(p95)}ms · 버전 {status?.version ?? '-'}</span>
+            <strong>Pod 맵</strong>
+            <span>p95 {Math.round(p95)}ms · v{status?.version?.replace(/^v/, '') ?? '-'}</span>
           </div>
           <div className="legend">
-            <span><i className="low" />낮음</span>
-            <span><i className="mid" />주의</span>
-            <span><i className="high" />위험</span>
+            <span><i className="good" />정상</span>
+            <span><i className="warn" />대기</span>
+            <span><i className="bad" />병목</span>
           </div>
         </div>
-        <canvas ref={canvasRef} className="pod-canvas" aria-label="TPS 파드 히트맵" />
+        <div className="treemap" aria-label="송신 파드 히트맵">
+          {boxes.map((box, index) => (
+            <article key={`${box.name}-${index}`} className={`tile ${heatClass(pressure, box.ready)}`} style={tileStyle(box, pressure)}>
+              <b>{box.name}</b>
+              <strong>{box.ready ? '정상' : '대기'}</strong>
+              <span>보냄 {formatCount(perPodSent)}</span>
+              <span>큐 {formatCount(perPodQueue)}</span>
+            </article>
+          ))}
+        </div>
       </section>
     </main>
   );
