@@ -49,7 +49,7 @@ interface Product { id: number; name: string; price_cents: number; stock: number
 interface Order { id: number; status: string; total_cents: number; created_at: string }
 
 const scenarios = [
-  ['scale-surge/start', 'Pod Surge', 'Deployment 2 -> 6'],
+  ['scale-surge/start', 'Pod Surge', 'Deployment 2 -> 6+'],
   ['load/start', 'Traffic Burn', 'CPU pressure'],
   ['db-bulk-insert/start', 'Bulk Save', 'orders + audit'],
   ['db-lock/start', 'DB Lock', 'inventory lock'],
@@ -195,11 +195,11 @@ export default function App() {
           <div className="surge-card">
             <button onClick={() => runScenario('scale-surge/start', 'Pod Surge')} disabled={!!busy}>
               <b>Pod Surge</b>
-              <span>2 to 6 replicas</span>
+              <span>2 to 6+ replicas</span>
             </button>
             <button onClick={() => runScenario('recover', 'Recover')} disabled={!!busy}>
               <b>Recover</b>
-              <span>6 to 2 replicas</span>
+              <span>back to 2 replicas</span>
             </button>
           </div>
           <div className="buttons">
