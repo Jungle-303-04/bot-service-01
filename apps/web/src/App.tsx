@@ -5,8 +5,6 @@ interface Pod {
   phase: string;
   ready: boolean;
   restarts: number;
-  node: string;
-  pod_ip?: string;
   age_seconds: number;
 }
 
@@ -18,29 +16,27 @@ interface Cluster {
   ready_replicas: number;
   available_replicas: number;
   updated_replicas: number;
+  generation: number;
+  observed_generation: number;
+  template_version: string;
+  template_flavor: string;
+  rollout_complete: boolean;
   pods: Pod[];
   hpa: {
-    available: boolean;
     min_replicas?: number;
     max_replicas?: number;
     target_cpu_utilization?: number | null;
     current_cpu_utilization?: number | null;
-    current_replicas?: number;
-    desired_replicas?: number;
   };
   error?: string;
-  reason?: string;
 }
 
 interface Status {
   service: string;
-  title: string;
-  kind: string;
   version: string;
   flavor: string;
-  generated_at: string;
   scenarios: Record<string, boolean>;
-  metrics: { p95_latency_ms: number; request_samples: number; background_tasks: number };
+  metrics: { p95_latency_ms: number; background_tasks: number };
   rows: Record<string, number>;
   cluster: Cluster;
 }
@@ -48,24 +44,13 @@ interface Status {
 interface Product { id: number; name: string; price_cents: number; stock: number }
 interface Order { id: number; status: string; total_cents: number; created_at: string }
 
-const scenarios = [
-  ['scale-surge/start', 'Pod Surge', 'Deployment 2 -> 6+'],
-  ['load/start', 'Traffic Burn', 'CPU pressure'],
-  ['db-bulk-insert/start', 'Bulk Save', 'orders + audit'],
-  ['db-lock/start', 'DB Lock', 'inventory lock'],
-  ['db-slow-query/start', 'Slow Query', 'latency injection'],
-  ['error-spike/start', 'Error Spike', 'intentional 5xx'],
-  ['crashloop/start', 'CrashLoop', 'pod restart'],
-  ['recover', 'Recover', 'replicas 6 -> 2'],
-];
-
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) } });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
-function podShort(name: string) {
+function shortName(name: string) {
   return name.split('-').slice(-2).join('-');
 }
 
@@ -79,9 +64,8 @@ export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
-  const [notice, setNotice] = useState('cluster signal standby');
+  const [notice, setNotice] = useState('운영 상태 확인 중');
   const [busy, setBusy] = useState('');
-  const [storming, setStorming] = useState(false);
   const stormRef = useRef<number | null>(null);
 
   const refresh = async () => {
@@ -96,33 +80,28 @@ export default function App() {
   };
 
   const stopStorm = () => {
-    if (stormRef.current) {
-      window.clearInterval(stormRef.current);
-      stormRef.current = null;
-    }
-    setStorming(false);
+    if (stormRef.current) window.clearInterval(stormRef.current);
+    stormRef.current = null;
   };
 
   const startStorm = (durationMs: number) => {
     stopStorm();
-    setStorming(true);
-    const deadline = Date.now() + durationMs;
+    const endAt = Date.now() + durationMs;
     stormRef.current = window.setInterval(() => {
-      if (Date.now() > deadline) {
+      if (Date.now() > endAt) {
         stopStorm();
         return;
       }
       void Promise.allSettled([
         api('/api/work', { method: 'POST' }),
         api('/api/work', { method: 'POST' }),
-        api('/api/work', { method: 'POST' }),
       ]);
-    }, 380);
+    }, 450);
   };
 
   useEffect(() => {
     void refresh();
-    const id = window.setInterval(() => { void refresh(); }, 1800);
+    const id = window.setInterval(() => { void refresh(); }, 1600);
     return () => {
       window.clearInterval(id);
       stopStorm();
@@ -130,172 +109,147 @@ export default function App() {
   }, []);
 
   const cluster = status?.cluster;
-  const activeCount = status ? Object.values(status.scenarios).filter(Boolean).length : 0;
-  const desired = cluster?.desired_replicas ?? 2;
+  const desired = cluster?.desired_replicas ?? 0;
   const ready = cluster?.ready_replicas ?? 0;
-  const podCount = cluster?.pods.length ?? 0;
-  const surgeActive = Boolean(status?.scenarios.scale_surge) || desired > 2 || storming;
-  const pressure = useMemo(() => {
-    if (!status) return 0;
-    const replicaPressure = Math.min(Math.max(desired - 2, 0) / 4, 0.42);
-    const latencyPressure = Math.min(status.metrics.p95_latency_ms / 1000, 0.34);
-    return Math.min(1, replicaPressure + latencyPressure + activeCount * 0.08 + (storming ? 0.16 : 0));
-  }, [status, desired, activeCount, storming]);
-  const slots = Math.max(6, desired, podCount);
-  const readinessPct = desired ? Math.round((ready / desired) * 100) : 0;
+  const updated = cluster?.updated_replicas ?? 0;
+  const rolloutPct = desired ? Math.round((Math.min(updated, desired) / desired) * 100) : 0;
+  const activeIncidents = status ? Object.values(status.scenarios).filter(Boolean).length : 0;
+  const releaseTone = !cluster?.rollout_complete ? 'rolling' : cluster.template_flavor !== 'stable' ? 'fault' : 'stable';
+  const rolloutLabel = !cluster?.rollout_complete ? '배포 중' : cluster.template_flavor !== 'stable' ? '장애 버전' : '정상';
 
-  const runScenario = async (name: string, label: string) => {
+  const runRelease = async (action: 'deploy' | 'faulty' | 'rollback', label: string) => {
     setBusy(label);
     try {
-      await api(`/api/scenarios/${name}`, { method: 'POST' });
-      if (name === 'scale-surge/start') startStorm(65000);
-      if (name === 'load/start') startStorm(30000);
-      if (name === 'recover' || name === 'scale-surge/stop') stopStorm();
-      setNotice(`${label} dispatched`);
+      const result = await api<{ version: string; flavor: string; status: string }>(`/api/releases/${action}`, { method: 'POST' });
+      if (action === 'rollback') stopStorm();
+      setNotice(`${label}: ${result.version}`);
       await refresh();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'scenario failed');
+      setNotice(error instanceof Error ? error.message : '릴리스 작업 실패');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const runIncident = async (path: string, label: string) => {
+    setBusy(label);
+    try {
+      await api(`/api/scenarios/${path}`, { method: 'POST' });
+      if (path === 'scale-surge/start' || path === 'load/start') startStorm(60000);
+      if (path === 'recover') stopStorm();
+      setNotice(`${label} 실행됨`);
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '운영 작업 실패');
     } finally {
       setBusy('');
     }
   };
 
   const createOrder = async () => {
-    setBusy('Create Order');
+    setBusy('주문');
     try {
       await api('/api/orders', { method: 'POST' });
-      setNotice('order persisted');
+      setNotice('주문 저장 완료');
       await refresh();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'order failed');
+      setNotice(error instanceof Error ? error.message : '주문 저장 실패');
     } finally {
       setBusy('');
     }
   };
 
   return (
-    <main className="shell" style={{ ['--pressure' as string]: pressure }}>
-      <section className="ops-bar">
+    <main className="shell">
+      <section className="topbar">
         <div>
-          <p className="label">bot-service-01 / checkout</p>
-          <h1>Checkout Pulse</h1>
+          <p className="eyebrow">bot-service-01</p>
+          <h1>체크아웃 운영</h1>
         </div>
-        <div className="release">
-          <span>{status?.version ?? 'loading'}</span>
-          <strong>{status?.flavor ?? 'stable'}</strong>
-        </div>
+        <span className={`state ${releaseTone}`}>{rolloutLabel}</span>
       </section>
 
-      <section className="stage">
-        <aside className="panel command">
+      <section className="summary">
+        <Metric label="운영 중 버전" value={status?.version ?? '로딩 중'} tone={status?.flavor !== 'stable' ? 'fault' : undefined} />
+        <Metric label="목표 버전" value={cluster?.template_version ?? '로딩 중'} tone={cluster?.template_flavor !== 'stable' ? 'fault' : undefined} />
+        <Metric label="파드 준비" value={`${ready}/${desired}`} />
+        <Metric label="p95" value={`${Math.round(status?.metrics.p95_latency_ms ?? 0)}ms`} />
+      </section>
+
+      <section className="layout">
+        <aside className="panel controls">
           <div className="panel-title">
-            <strong>Scenario Console</strong>
+            <strong>릴리스 제어</strong>
             <span>{notice}</span>
           </div>
-          <div className="surge-card">
-            <button onClick={() => runScenario('scale-surge/start', 'Pod Surge')} disabled={!!busy}>
-              <b>Pod Surge</b>
-              <span>2 to 6+ replicas</span>
-            </button>
-            <button onClick={() => runScenario('recover', 'Recover')} disabled={!!busy}>
-              <b>Recover</b>
-              <span>back to 2 replicas</span>
-            </button>
+          <div className="button-stack primary-actions">
+            <button onClick={() => runRelease('deploy', '새 버전 배포')} disabled={!!busy}>새 버전 배포</button>
+            <button onClick={() => runRelease('faulty', '장애 버전 배포')} disabled={!!busy}>장애 버전 배포</button>
+            <button onClick={() => runRelease('rollback', '롤백')} disabled={!!busy}>롤백</button>
           </div>
-          <div className="buttons">
-            {scenarios.slice(1, -1).map(([path, label, desc]) => (
-              <button key={path} onClick={() => runScenario(path, label)} disabled={!!busy} title={desc}>
-                <span>{label}</span>
-                <small>{busy === label ? 'running' : desc}</small>
-              </button>
-            ))}
+
+          <div className="panel-title compact">
+            <strong>장애 제어</strong>
+            <span>{activeIncidents} active</span>
           </div>
-          <button className="primary" onClick={createOrder} disabled={!!busy}>Create Checkout Event</button>
+          <div className="button-grid">
+            <button onClick={() => runIncident('scale-surge/start', '부하 증가')} disabled={!!busy}>부하 증가</button>
+            <button onClick={() => runIncident('db-bulk-insert/start', '대량 저장')} disabled={!!busy}>대량 저장</button>
+            <button onClick={() => runIncident('error-spike/start', '오류 증가')} disabled={!!busy}>오류 증가</button>
+            <button onClick={() => runIncident('recover', '복구')} disabled={!!busy}>복구</button>
+          </div>
+          <button className="order-button" onClick={createOrder} disabled={!!busy}>주문 저장</button>
         </aside>
 
-        <section className={`panel cluster ${surgeActive ? 'surging' : ''}`}>
+        <section className="panel rollout">
           <div className="panel-title">
-            <strong>Live API Pods</strong>
-            <span>{cluster?.deployment ?? 'deployment'} · {cluster?.namespace ?? 'namespace'}</span>
+            <strong>롤아웃 상태</strong>
+            <span>세대 {cluster?.observed_generation ?? 0}/{cluster?.generation ?? 0}</span>
           </div>
-          <div className="replica-board">
+          <div className="progress-row">
             <div>
-              <span>ready</span>
-              <strong>{ready}/{desired}</strong>
+              <span>갱신됨</span>
+              <strong>{updated}/{desired}</strong>
             </div>
             <div>
-              <span>pods</span>
-              <strong>{podCount}</strong>
+              <span>사용 가능</span>
+              <strong>{cluster?.available_replicas ?? 0}/{desired}</strong>
             </div>
             <div>
-              <span>p95</span>
-              <strong>{Math.round(status?.metrics.p95_latency_ms ?? 0)}ms</strong>
-            </div>
-            <div>
-              <span>hpa cpu</span>
-              <strong>{cluster?.hpa.current_cpu_utilization ?? 0}%/{cluster?.hpa.target_cpu_utilization ?? 60}%</strong>
+              <span>HPA</span>
+              <strong>{cluster?.hpa.min_replicas ?? 0}/{cluster?.hpa.max_replicas ?? 0}</strong>
             </div>
           </div>
-          <div className="readiness">
-            <i style={{ width: `${Math.min(100, readinessPct)}%` }} />
+          <div className="progress">
+            <i style={{ width: `${rolloutPct}%` }} />
           </div>
-          <div className="pod-grid">
-            {Array.from({ length: slots }, (_, i) => {
-              const pod = cluster?.pods[i];
-              return (
-                <article className={`pod ${pod?.ready ? 'ready' : pod ? 'pending' : 'empty'}`} key={pod?.name ?? i}>
-                  <b>{pod ? podShort(pod.name) : 'warming'}</b>
-                  <span>{pod ? `${pod.phase} · ${age(pod.age_seconds)}` : 'slot'}</span>
-                  <em>{pod ? `restart ${pod.restarts}` : 'pending'}</em>
-                </article>
-              );
-            })}
-          </div>
-          {cluster?.error && <p className="cluster-error">{cluster.error}</p>}
-        </section>
-
-        <section className="heat-panel">
-          <div className="heat-head">
-            <strong>Checkout Load Heat</strong>
-            <span>{storming ? 'traffic storm active' : `${activeCount} scenario active`}</span>
-          </div>
-          <div className="flow-lanes">
-            {['cart', 'order', 'payment', 'inventory'].map((lane, i) => (
-              <div className="lane" key={lane} style={{ ['--i' as string]: i }}>
-                <span>{lane}</span>
-                <i />
-                <i />
-                <i />
-              </div>
-            ))}
-          </div>
-          <div className="heat">
-            {Array.from({ length: 54 }, (_, i) => (
-              <span key={i} style={{ ['--n' as string]: i }} />
+          <div className="pod-list">
+            {(cluster?.pods ?? []).map((pod) => (
+              <article className={`pod ${pod.ready ? 'ready' : 'pending'}`} key={pod.name}>
+                <b>{shortName(pod.name)}</b>
+                <span>{pod.phase} · {age(pod.age_seconds)}</span>
+                <em>restart {pod.restarts}</em>
+              </article>
             ))}
           </div>
         </section>
       </section>
 
-      <section className="metrics">
-        <Metric label="Orders" value={status?.rows.orders ?? 0} />
-        <Metric label="Payments" value={status?.rows.payments ?? 0} />
-        <Metric label="Audit rows" value={status?.rows.audit_logs ?? 0} />
-        <Metric label="Telemetry" value={status?.rows.telemetry_samples ?? 0} />
-      </section>
-
-      <section className="split">
+      <section className="data-grid">
         <div className="panel">
-          <div className="panel-title"><strong>Products</strong><span>PostgreSQL</span></div>
+          <div className="panel-title"><strong>주문</strong><span>{status?.rows.orders?.toLocaleString() ?? 0}</span></div>
           <div className="rows">
-            {products.map(p => <div key={p.id}><b>{p.name}</b><span>{(p.price_cents / 100).toLocaleString()}원 · stock {p.stock}</span></div>)}
+            {orders.slice(0, 8).map(order => (
+              <div key={order.id}><b>#{order.id} · {order.status}</b><span>{(order.total_cents / 100).toLocaleString()}원</span></div>
+            ))}
           </div>
         </div>
         <div className="panel">
-          <div className="panel-title"><strong>Recent Orders</strong><span>latest 20</span></div>
+          <div className="panel-title"><strong>상품</strong><span>PostgreSQL</span></div>
           <div className="rows">
-            {orders.length === 0 && <div><b>empty</b><span>waiting for checkout</span></div>}
-            {orders.map(o => <div key={o.id}><b>#{o.id} · {o.status}</b><span>{(o.total_cents / 100).toLocaleString()}원 · {new Date(o.created_at).toLocaleTimeString()}</span></div>)}
+            {products.map(product => (
+              <div key={product.id}><b>{product.name}</b><span>stock {product.stock}</span></div>
+            ))}
           </div>
         </div>
       </section>
@@ -303,6 +257,6 @@ export default function App() {
   );
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
-  return <div className="metric"><span>{label}</span><strong>{Math.round(value).toLocaleString()}</strong></div>;
+function Metric({ label, value, tone }: { label: string; value: string; tone?: string }) {
+  return <div className={`metric ${tone ?? ''}`}><span>{label}</span><strong>{value}</strong></div>;
 }
