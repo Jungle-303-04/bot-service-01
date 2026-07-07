@@ -34,6 +34,9 @@ DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", f"{SERVICE_NAME}-api")
 BASE_REPLICAS = int(os.getenv("BASE_REPLICAS", "1"))
 SURGE_REPLICAS = int(os.getenv("SURGE_REPLICAS", "6"))
 HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "10"))
+PEER_API_BASE = os.getenv("PEER_API_BASE", "http://bot-02.woonyong.org").rstrip("/")
+MAX_TRAFFIC_TPS = int(os.getenv("MAX_TRAFFIC_TPS", "10000"))
+SENDER_CAPACITY_PER_POD = int(os.getenv("SENDER_CAPACITY_PER_POD", "1500"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
@@ -53,9 +56,30 @@ scenario_state: dict[str, bool] = {
     "db_lock": False,
     "db_slow_query": False,
     "error_spike": False,
+    "traffic_link": False,
 }
 background_tasks: set[asyncio.Task[Any]] = set()
 last_scenario_sync = 0.0
+traffic_lock = asyncio.Lock()
+traffic_task: asyncio.Task[Any] | None = None
+traffic_state: dict[str, Any] = {
+    "role": "sender",
+    "running": False,
+    "mode": "manual",
+    "target_tps": 0,
+    "manual_replicas": BASE_REPLICAS,
+    "ready_replicas": BASE_REPLICAS,
+    "desired_replicas": BASE_REPLICAS,
+    "queue_depth": 0.0,
+    "sent_total": 0,
+    "accepted_total": 0,
+    "failed_total": 0,
+    "peer_queue_depth": 0.0,
+    "peer_ready_replicas": 0,
+    "peer_desired_replicas": 0,
+    "last_tick": time.monotonic(),
+    "updated_at": "",
+}
 
 
 def utc_now() -> str:
@@ -464,6 +488,166 @@ def replicas_for_tps(target_tps: int) -> int:
     return max(BASE_REPLICAS, min(HPA_MAX_REPLICAS, (max(1, target_tps) + 999) // 1000))
 
 
+def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def parse_traffic_payload(payload: dict[str, Any]) -> tuple[int, str, int]:
+    target_tps = clamp_int(payload.get("target_tps"), 1000, 1, MAX_TRAFFIC_TPS)
+    mode = str(payload.get("mode", "manual")).lower()
+    if mode not in {"manual", "auto"}:
+        mode = "manual"
+    manual_replicas = clamp_int(payload.get("manual_replicas"), BASE_REPLICAS, 1, HPA_MAX_REPLICAS)
+    return target_tps, mode, manual_replicas
+
+
+def target_replicas_for_mode(target_tps: int, mode: str, manual_replicas: int) -> int:
+    return manual_replicas if mode == "manual" else replicas_for_tps(target_tps)
+
+
+async def apply_traffic_replicas(target_tps: int, mode: str, manual_replicas: int) -> dict[str, Any]:
+    target_replicas = target_replicas_for_mode(target_tps, mode, manual_replicas)
+    hpa_max = target_replicas if mode == "manual" else HPA_MAX_REPLICAS
+    await patch_hpa_bounds(target_replicas, hpa_max)
+    scale = await scale_api_deployment(target_replicas)
+    return {
+        "target_replicas": target_replicas,
+        "hpa_max_replicas": hpa_max,
+        "observed_replicas": scale.get("spec", {}).get("replicas"),
+    }
+
+
+def peer_request(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{PEER_API_BASE}{path}",
+        data=data,
+        headers={"content-type": "application/json", "accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"peer API {path} failed with {exc.code}: {detail[:220]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"peer API {path} is unreachable: {exc.reason}") from exc
+
+
+async def peer_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return await asyncio.to_thread(peer_request, path, payload)
+
+
+async def traffic_cluster_refresh() -> None:
+    cluster = await cluster_snapshot()
+    async with traffic_lock:
+        traffic_state["ready_replicas"] = max(1, int(cluster.get("ready_replicas") or cluster.get("desired_replicas") or BASE_REPLICAS))
+        traffic_state["desired_replicas"] = max(1, int(cluster.get("desired_replicas") or traffic_state["ready_replicas"]))
+
+
+async def record_sender_batch(units: int, accepted: int, failed: int, peer_queue: int) -> None:
+    await exec_db(
+        "traffic_link_sender",
+        "INSERT INTO audit_logs(event_type, payload) VALUES($1, $2::jsonb)",
+        "traffic.link.sent",
+        json_arg({
+            "units": units,
+            "accepted": accepted,
+            "failed": failed,
+            "peer_queue": peer_queue,
+            "peer": PEER_API_BASE,
+            "service": SERVICE_NAME,
+            "at": utc_now(),
+        }),
+    )
+    await exec_db(
+        "traffic_link_metric",
+        "INSERT INTO telemetry_samples(metric, value) VALUES($1, $2)",
+        "traffic.link.accepted" if failed == 0 else "traffic.link.failed",
+        accepted if failed == 0 else failed,
+    )
+
+
+async def sender_loop() -> None:
+    last_cluster_refresh = 0.0
+    while True:
+        async with traffic_lock:
+            running = bool(traffic_state["running"])
+        if not running:
+            return
+
+        now = time.monotonic()
+        if now - last_cluster_refresh >= 1:
+            await traffic_cluster_refresh()
+            last_cluster_refresh = now
+
+        async with traffic_lock:
+            elapsed = max(0.05, now - float(traffic_state["last_tick"]))
+            traffic_state["last_tick"] = now
+            ready = max(1, int(traffic_state["ready_replicas"]))
+            produced = float(traffic_state["target_tps"]) * elapsed
+            traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) + produced)
+            send_capacity = ready * SENDER_CAPACITY_PER_POD * elapsed
+            send_units = int(min(float(traffic_state["queue_depth"]), send_capacity, 2000))
+            traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) - send_units)
+            target_tps = int(traffic_state["target_tps"])
+
+        if send_units > 0:
+            accepted_total = 0
+            failed_total = 0
+            peer_queue = 0
+            peer_ready = 0
+            peer_desired = 0
+            chunks = [min(1000, send_units - index) for index in range(0, send_units, 1000)]
+            for chunk in chunks:
+                try:
+                    result = await peer_post(
+                        "/api/traffic/receive",
+                        {"units": chunk, "sender": SERVICE_NAME, "target_tps": target_tps},
+                    )
+                    accepted_total += int(result.get("accepted", 0))
+                    failed_total += int(result.get("failed", 0))
+                    peer_queue = int(result.get("queue_depth", peer_queue))
+                    peer_ready = int(result.get("ready_replicas", peer_ready) or peer_ready)
+                    peer_desired = int(result.get("desired_replicas", peer_desired) or peer_desired)
+                except RuntimeError:
+                    failed_total += chunk
+                    ERRORS.labels(SERVICE_NAME, "peer_request_failed").inc()
+            async with traffic_lock:
+                traffic_state["sent_total"] = int(traffic_state["sent_total"]) + send_units
+                traffic_state["accepted_total"] = int(traffic_state["accepted_total"]) + accepted_total
+                traffic_state["failed_total"] = int(traffic_state["failed_total"]) + failed_total
+                traffic_state["peer_queue_depth"] = peer_queue
+                traffic_state["peer_ready_replicas"] = peer_ready
+                traffic_state["peer_desired_replicas"] = peer_desired
+                traffic_state["updated_at"] = utc_now()
+            await record_sender_batch(send_units, accepted_total, failed_total, peer_queue)
+
+        await asyncio.sleep(0.2)
+
+
+def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
+    ready = max(1, int(cluster.get("ready_replicas") or cluster.get("desired_replicas") or BASE_REPLICAS))
+    desired = max(1, int(cluster.get("desired_replicas") or ready))
+    traffic_state["ready_replicas"] = ready
+    traffic_state["desired_replicas"] = desired
+    queue_depth = float(traffic_state["queue_depth"])
+    pressure = min(1.0, queue_depth / max(ready * SENDER_CAPACITY_PER_POD * 2, 1))
+    return {
+        **traffic_state,
+        "queue_depth": round(queue_depth),
+        "pressure": round(pressure, 3),
+        "capacity_per_second": ready * SENDER_CAPACITY_PER_POD,
+        "peer": PEER_API_BASE,
+    }
+
+
 async def cpu_burn() -> None:
     await set_scenario("load", True)
     deadline = time.monotonic() + CPU_BURN_SECONDS
@@ -618,6 +802,7 @@ async def status() -> dict[str, Any]:
         },
         "rows": counts,
         "cluster": cluster,
+        "traffic": traffic_snapshot(cluster),
     }
 
 
@@ -776,36 +961,80 @@ async def stop_load() -> dict[str, Any]:
     return {"scenario": "load", "status": "stopped"}
 
 
-@app.post("/api/scenarios/traffic/start")
-async def start_traffic(request: Request) -> dict[str, Any]:
+@app.post("/api/traffic/start")
+async def start_link_traffic(request: Request) -> dict[str, Any]:
+    global traffic_task
     payload: dict[str, Any] = {}
     try:
         payload = await request.json()
     except Exception:
         payload = {}
-    target_tps = max(1, min(10000, int(payload.get("target_tps", 1000) or 1000)))
-    target_replicas = replicas_for_tps(target_tps)
-    await set_scenario("scale_surge", True)
+    target_tps, mode, manual_replicas = parse_traffic_payload(payload)
+    scale_error = None
     try:
-        await patch_hpa_bounds(target_replicas, HPA_MAX_REPLICAS)
-        scale = await scale_api_deployment(target_replicas)
+        local_scale = await apply_traffic_replicas(target_tps, mode, manual_replicas)
     except RuntimeError as exc:
-        await set_scenario("scale_surge", False)
+        scale_error = str(exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if target_tps >= 3000:
-        track(asyncio.create_task(cpu_burn()))
+
+    try:
+        peer_state = await peer_post(
+            "/api/traffic/receiver/start",
+            {"target_tps": target_tps, "mode": mode, "manual_replicas": manual_replicas},
+        )
+    except RuntimeError as exc:
+        await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
+        await scale_api_deployment(BASE_REPLICAS)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    async with traffic_lock:
+        traffic_state.update({
+            "running": True,
+            "mode": mode,
+            "target_tps": target_tps,
+            "manual_replicas": manual_replicas,
+            "queue_depth": 0.0,
+            "sent_total": 0,
+            "accepted_total": 0,
+            "failed_total": 0,
+            "peer_queue_depth": 0.0,
+            "peer_ready_replicas": int(peer_state.get("ready_replicas", 0) or 0),
+            "peer_desired_replicas": int(peer_state.get("target_replicas", 0) or 0),
+            "last_tick": time.monotonic(),
+            "updated_at": utc_now(),
+        })
+    await set_scenario("traffic_link", True)
+    await set_scenario("scale_surge", mode == "auto")
+    if traffic_task is None or traffic_task.done():
+        traffic_task = asyncio.create_task(sender_loop())
+        track(traffic_task)
     return {
-        "scenario": "traffic",
+        "scenario": "traffic_link",
         "status": "started",
+        "mode": mode,
         "target_tps": target_tps,
-        "target_replicas": target_replicas,
-        "max_replicas": HPA_MAX_REPLICAS,
-        "observed_replicas": scale.get("spec", {}).get("replicas"),
+        "manual_replicas": manual_replicas,
+        "local": local_scale,
+        "peer": peer_state,
+        "scale_error": scale_error,
     }
 
 
-@app.post("/api/scenarios/traffic/stop")
-async def stop_traffic() -> dict[str, Any]:
+@app.post("/api/traffic/stop")
+async def stop_link_traffic() -> dict[str, Any]:
+    async with traffic_lock:
+        traffic_state.update({
+            "running": False,
+            "target_tps": 0,
+            "queue_depth": 0.0,
+            "peer_queue_depth": 0.0,
+            "updated_at": utc_now(),
+        })
+    peer_error = None
+    try:
+        await peer_post("/api/traffic/receiver/stop", {})
+    except RuntimeError as exc:
+        peer_error = str(exc)
     try:
         await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
         scale = await scale_api_deployment(BASE_REPLICAS)
@@ -813,13 +1042,25 @@ async def stop_traffic() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     await set_scenario("scale_surge", False)
     await set_scenario("load", False)
+    await set_scenario("traffic_link", False)
     return {
-        "scenario": "traffic",
+        "scenario": "traffic_link",
         "status": "stopped",
         "target_tps": 0,
         "target_replicas": BASE_REPLICAS,
         "observed_replicas": scale.get("spec", {}).get("replicas"),
+        "peer_error": peer_error,
     }
+
+
+@app.post("/api/scenarios/traffic/start")
+async def start_traffic(request: Request) -> dict[str, Any]:
+    return await start_link_traffic(request)
+
+
+@app.post("/api/scenarios/traffic/stop")
+async def stop_traffic() -> dict[str, Any]:
+    return await stop_link_traffic()
 
 
 @app.post("/api/scenarios/scale-surge/start")
@@ -968,6 +1209,19 @@ async def start_crashloop() -> dict[str, Any]:
 
 @app.post("/api/scenarios/recover")
 async def recover() -> dict[str, Any]:
+    async with traffic_lock:
+        traffic_state.update({
+            "running": False,
+            "target_tps": 0,
+            "queue_depth": 0.0,
+            "peer_queue_depth": 0.0,
+            "updated_at": utc_now(),
+        })
+    peer_error = None
+    try:
+        await peer_post("/api/traffic/receiver/stop", {})
+    except RuntimeError as exc:
+        peer_error = str(exc)
     scale_error = None
     if kube_available():
         try:
@@ -977,4 +1231,10 @@ async def recover() -> dict[str, Any]:
             scale_error = str(exc)
     for name in list(scenario_state):
         await set_scenario(name, False)
-    return {"status": "recovering", "service": SERVICE_NAME, "replicas": BASE_REPLICAS, "scale_error": scale_error}
+    return {
+        "status": "recovering",
+        "service": SERVICE_NAME,
+        "replicas": BASE_REPLICAS,
+        "scale_error": scale_error,
+        "peer_error": peer_error,
+    }
