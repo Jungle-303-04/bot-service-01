@@ -23,6 +23,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 SERVICE_NAME = os.getenv("SERVICE_NAME", "bot-service-01")
 SERVICE_TITLE = os.getenv("SERVICE_TITLE", "Checkout Pulse")
 SERVICE_KIND = os.getenv("SERVICE_KIND", "checkout")
+POD_NAME = os.getenv("HOSTNAME", SERVICE_NAME)
 APP_VERSION = os.getenv("APP_VERSION", "v1.0.0-stable")
 APP_FLAVOR = os.getenv("APP_FLAVOR", "stable")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/bot_service_01")
@@ -35,7 +36,7 @@ BASE_REPLICAS = int(os.getenv("BASE_REPLICAS", "1"))
 SURGE_REPLICAS = int(os.getenv("SURGE_REPLICAS", "6"))
 HPA_MAX_REPLICAS = int(os.getenv("HPA_MAX_REPLICAS", "10"))
 PEER_API_BASE = os.getenv("PEER_API_BASE", "http://bot-02.woonyong.org").rstrip("/")
-MAX_TRAFFIC_TPS = int(os.getenv("MAX_TRAFFIC_TPS", "10000"))
+MAX_TRAFFIC_TPS = int(os.getenv("MAX_TRAFFIC_TPS", "0"))
 SENDER_CAPACITY_PER_POD = int(os.getenv("SENDER_CAPACITY_PER_POD", "1500"))
 KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -74,9 +75,13 @@ traffic_state: dict[str, Any] = {
     "sent_total": 0,
     "accepted_total": 0,
     "failed_total": 0,
+    "sent_per_second": 0,
+    "accepted_per_second": 0,
+    "failed_per_second": 0,
     "peer_queue_depth": 0.0,
     "peer_ready_replicas": 0,
     "peer_desired_replicas": 0,
+    "started_at": "",
     "last_tick": time.monotonic(),
     "updated_at": "",
 }
@@ -182,6 +187,11 @@ async def init_schema() -> None:
               enabled BOOLEAN NOT NULL DEFAULT false,
               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+            CREATE TABLE IF NOT EXISTS traffic_runtime (
+              key TEXT PRIMARY KEY,
+              payload JSONB NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
             """
         )
         await conn.execute(
@@ -243,6 +253,42 @@ async def set_scenario(name: str, enabled: bool) -> None:
         "scenario.changed",
         json_arg({"name": name, "enabled": enabled, "service": SERVICE_NAME, "at": utc_now()}),
     )
+
+
+def parse_timestamp(value: Any) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return datetime.now(UTC)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def decode_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        return json.loads(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+async def save_traffic_runtime(payload: dict[str, Any]) -> None:
+    await exec_db(
+        "traffic_runtime",
+        """
+        INSERT INTO traffic_runtime(key, payload, updated_at)
+        VALUES('traffic', $1::jsonb, now())
+        ON CONFLICT (key)
+        DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+        """,
+        json_arg(payload),
+    )
+
+
+async def load_traffic_runtime() -> dict[str, Any]:
+    rows = await timed_db("traffic_runtime", "SELECT payload FROM traffic_runtime WHERE key = 'traffic'")
+    return decode_payload(rows[0]["payload"]) if rows else {}
 
 
 async def sync_scenarios_from_db(force: bool = False) -> dict[str, bool]:
@@ -485,7 +531,7 @@ def live_release_version(label: str) -> str:
 
 
 def replicas_for_tps(target_tps: int) -> int:
-    return max(BASE_REPLICAS, min(HPA_MAX_REPLICAS, (max(1, target_tps) + 999) // 1000))
+    return max(BASE_REPLICAS, (max(1, target_tps) + 999) // 1000)
 
 
 def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -496,12 +542,20 @@ def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+def positive_int(value: Any, default: int = 1000) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
+
+
 def parse_traffic_payload(payload: dict[str, Any]) -> tuple[int, str, int]:
-    target_tps = clamp_int(payload.get("target_tps"), 1000, 1, MAX_TRAFFIC_TPS)
+    target_tps = positive_int(payload.get("target_tps"), 1000)
     mode = str(payload.get("mode", "manual")).lower()
     if mode not in {"manual", "auto"}:
         mode = "manual"
-    manual_replicas = clamp_int(payload.get("manual_replicas"), BASE_REPLICAS, 1, HPA_MAX_REPLICAS)
+    manual_replicas = positive_int(payload.get("manual_replicas"), BASE_REPLICAS)
     return target_tps, mode, manual_replicas
 
 
@@ -511,7 +565,7 @@ def target_replicas_for_mode(target_tps: int, mode: str, manual_replicas: int) -
 
 async def apply_traffic_replicas(target_tps: int, mode: str, manual_replicas: int) -> dict[str, Any]:
     target_replicas = target_replicas_for_mode(target_tps, mode, manual_replicas)
-    hpa_max = target_replicas if mode == "manual" else HPA_MAX_REPLICAS
+    hpa_max = max(target_replicas, HPA_MAX_REPLICAS)
     await patch_hpa_bounds(target_replicas, hpa_max)
     scale = await scale_api_deployment(target_replicas)
     return {
@@ -562,6 +616,8 @@ async def record_sender_batch(units: int, accepted: int, failed: int, peer_queue
             "failed": failed,
             "peer_queue": peer_queue,
             "peer": PEER_API_BASE,
+            "pod": POD_NAME,
+            "queue_depth": round(float(traffic_state["queue_depth"])),
             "service": SERVICE_NAME,
             "at": utc_now(),
         }),
@@ -576,6 +632,7 @@ async def record_sender_batch(units: int, accepted: int, failed: int, peer_queue
 
 async def sender_loop() -> None:
     last_cluster_refresh = 0.0
+    last_runtime_check = 0.0
     while True:
         async with traffic_lock:
             running = bool(traffic_state["running"])
@@ -583,6 +640,17 @@ async def sender_loop() -> None:
             return
 
         now = time.monotonic()
+        if now - last_runtime_check >= 1:
+            scenarios = await sync_scenarios_from_db(force=True)
+            if not scenarios.get("traffic_link", False):
+                async with traffic_lock:
+                    traffic_state["running"] = False
+                    traffic_state["updated_at"] = utc_now()
+                    runtime_payload = dict(traffic_state)
+                await save_traffic_runtime(runtime_payload)
+                return
+            last_runtime_check = now
+
         if now - last_cluster_refresh >= 1:
             await traffic_cluster_refresh()
             last_cluster_refresh = now
@@ -591,7 +659,8 @@ async def sender_loop() -> None:
             elapsed = max(0.05, now - float(traffic_state["last_tick"]))
             traffic_state["last_tick"] = now
             ready = max(1, int(traffic_state["ready_replicas"]))
-            produced = float(traffic_state["target_tps"]) * elapsed
+            workers = max(1, int(traffic_state["desired_replicas"]))
+            produced = float(traffic_state["target_tps"]) * elapsed / workers
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) + produced)
             send_capacity = ready * SENDER_CAPACITY_PER_POD * elapsed
             tick_limit = max(1000, HPA_MAX_REPLICAS * SENDER_CAPACITY_PER_POD)
@@ -624,29 +693,118 @@ async def sender_loop() -> None:
                 traffic_state["sent_total"] = int(traffic_state["sent_total"]) + send_units
                 traffic_state["accepted_total"] = int(traffic_state["accepted_total"]) + accepted_total
                 traffic_state["failed_total"] = int(traffic_state["failed_total"]) + failed_total
+                traffic_state["sent_per_second"] = send_units
+                traffic_state["accepted_per_second"] = accepted_total
+                traffic_state["failed_per_second"] = failed_total
                 traffic_state["peer_queue_depth"] = peer_queue
                 traffic_state["peer_ready_replicas"] = peer_ready
                 traffic_state["peer_desired_replicas"] = peer_desired
                 traffic_state["updated_at"] = utc_now()
+                runtime_payload = dict(traffic_state)
             await record_sender_batch(send_units, accepted_total, failed_total, peer_queue)
+            await save_traffic_runtime(runtime_payload)
 
         await asyncio.sleep(0.2)
 
 
-def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
+async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
     ready = max(1, int(cluster.get("ready_replicas") or cluster.get("desired_replicas") or BASE_REPLICAS))
     desired = max(1, int(cluster.get("desired_replicas") or ready))
-    traffic_state["ready_replicas"] = ready
-    traffic_state["desired_replicas"] = desired
-    queue_depth = float(traffic_state["queue_depth"])
+    runtime = await load_traffic_runtime()
+    state = {**traffic_state, **runtime}
+    state["ready_replicas"] = ready
+    state["desired_replicas"] = desired
+    if state.get("running") and state.get("started_at"):
+        started_at = parse_timestamp(state["started_at"])
+        async with current_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                  COALESCE(SUM((payload->>'units')::bigint), 0) AS sent_total,
+                  COALESCE(SUM((payload->>'accepted')::bigint), 0) AS accepted_total,
+                  COALESCE(SUM((payload->>'failed')::bigint), 0) AS failed_total,
+                  COALESCE(SUM((payload->>'units')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS sent_per_second,
+                  COALESCE(SUM((payload->>'accepted')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS accepted_per_second,
+                  COALESCE(SUM((payload->>'failed')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS failed_per_second
+                FROM audit_logs
+                WHERE event_type = 'traffic.link.sent'
+                  AND created_at >= $1
+                """,
+                started_at,
+            )
+        sent_total = int(row["sent_total"] or 0) if row else 0
+        accepted_total = int(row["accepted_total"] or 0) if row else 0
+        failed_total = int(row["failed_total"] or 0) if row else 0
+        sent_per_second = int(row["sent_per_second"] or 0) if row else 0
+        accepted_per_second = int(row["accepted_per_second"] or 0) if row else 0
+        failed_per_second = int(row["failed_per_second"] or 0) if row else 0
+        produced = int(state.get("target_tps") or 0) * max(0.0, (datetime.now(UTC) - started_at).total_seconds())
+        pod_rows = await timed_db(
+            "traffic_link_pods",
+            """
+            SELECT
+              payload->>'pod' AS pod,
+              COALESCE(SUM((payload->>'units')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS sent_per_second,
+              COALESCE(SUM((payload->>'accepted')::bigint) FILTER (WHERE created_at >= now() - interval '1 second'), 0) AS accepted_per_second,
+              COALESCE(MAX((payload->>'queue_depth')::double precision), 0) AS queue_depth
+            FROM audit_logs
+            WHERE event_type = 'traffic.link.sent'
+              AND created_at >= now() - interval '3 seconds'
+              AND payload ? 'pod'
+            GROUP BY payload->>'pod'
+            """,
+        )
+        pod_stats = {
+            row["pod"]: {
+                "sent_per_second": int(row["sent_per_second"] or 0),
+                "accepted_per_second": int(row["accepted_per_second"] or 0),
+                "queue_depth": round(float(row["queue_depth"] or 0)),
+            }
+            for row in pod_rows
+            if row["pod"]
+        }
+        state["sent_total"] = sent_total
+        state["accepted_total"] = accepted_total
+        state["failed_total"] = failed_total
+        state["sent_per_second"] = sent_per_second
+        state["accepted_per_second"] = accepted_per_second
+        state["failed_per_second"] = failed_per_second
+        state["pod_stats"] = pod_stats
+        state["queue_depth"] = max(float(state.get("queue_depth") or 0), produced - sent_total)
+    queue_depth = float(state.get("queue_depth") or 0)
     pressure = min(1.0, queue_depth / max(ready * SENDER_CAPACITY_PER_POD * 2, 1))
     return {
-        **traffic_state,
+        **state,
         "queue_depth": round(queue_depth),
         "pressure": round(pressure, 3),
         "capacity_per_second": ready * SENDER_CAPACITY_PER_POD,
         "peer": PEER_API_BASE,
     }
+
+
+async def ensure_sender_from_runtime(scenarios: dict[str, bool]) -> None:
+    global traffic_task
+    if not scenarios.get("traffic_link", False):
+        return
+    runtime = await load_traffic_runtime()
+    if not runtime.get("running"):
+        return
+    if traffic_task is None or traffic_task.done():
+        async with traffic_lock:
+            traffic_state.update(runtime)
+            traffic_state["last_tick"] = time.monotonic()
+        traffic_task = asyncio.create_task(sender_loop())
+        track(traffic_task)
+
+
+async def traffic_runtime_watcher() -> None:
+    while True:
+        try:
+            scenarios = await sync_scenarios_from_db(force=True)
+            await ensure_sender_from_runtime(scenarios)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
 
 
 async def cpu_burn() -> None:
@@ -720,6 +878,7 @@ async def lifespan(_: FastAPI):
     await sync_scenarios_from_db(force=True)
     for name, enabled in scenario_state.items():
         SCENARIO_ON.labels(SERVICE_NAME, name).set(1 if enabled else 0)
+    track(asyncio.create_task(traffic_runtime_watcher()))
     yield
     for task in list(background_tasks):
         task.cancel()
@@ -785,7 +944,9 @@ async def metrics() -> Response:
 @app.get("/api/status")
 async def status() -> dict[str, Any]:
     scenarios = await sync_scenarios_from_db(force=True)
+    await ensure_sender_from_runtime(scenarios)
     counts, cluster = await asyncio.gather(refresh_row_gauges(), cluster_snapshot())
+    traffic = await traffic_snapshot(cluster)
     samples = list(latency_samples)
     p95 = sorted(samples)[int(len(samples) * 0.95) - 1] if samples else 0
     return {
@@ -803,7 +964,7 @@ async def status() -> dict[str, Any]:
         },
         "rows": counts,
         "cluster": cluster,
-        "traffic": traffic_snapshot(cluster),
+        "traffic": traffic,
     }
 
 
@@ -981,13 +1142,19 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
     try:
         peer_state = await peer_post(
             "/api/traffic/receiver/start",
-            {"target_tps": target_tps, "mode": mode, "manual_replicas": manual_replicas},
+            {
+                "target_tps": target_tps,
+                "mode": mode,
+                "manual_replicas": BASE_REPLICAS,
+                "source": "sender",
+            },
         )
     except RuntimeError as exc:
         await patch_hpa_bounds(BASE_REPLICAS, BASE_REPLICAS)
         await scale_api_deployment(BASE_REPLICAS)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    started_at = utc_now()
     async with traffic_lock:
         traffic_state.update({
             "running": True,
@@ -1001,9 +1168,12 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
             "peer_queue_depth": 0.0,
             "peer_ready_replicas": int(peer_state.get("ready_replicas", 0) or 0),
             "peer_desired_replicas": int(peer_state.get("target_replicas", 0) or 0),
+            "started_at": started_at,
             "last_tick": time.monotonic(),
-            "updated_at": utc_now(),
+            "updated_at": started_at,
         })
+        runtime_payload = dict(traffic_state)
+    await save_traffic_runtime(runtime_payload)
     await set_scenario("traffic_link", True)
     await set_scenario("scale_surge", mode == "auto")
     if traffic_task is None or traffic_task.done():
@@ -1031,6 +1201,8 @@ async def stop_link_traffic() -> dict[str, Any]:
             "peer_queue_depth": 0.0,
             "updated_at": utc_now(),
         })
+        runtime_payload = dict(traffic_state)
+    await save_traffic_runtime(runtime_payload)
     peer_error = None
     try:
         await peer_post("/api/traffic/receiver/stop", {})
@@ -1218,6 +1390,8 @@ async def recover() -> dict[str, Any]:
             "peer_queue_depth": 0.0,
             "updated_at": utc_now(),
         })
+        runtime_payload = dict(traffic_state)
+    await save_traffic_runtime(runtime_payload)
     peer_error = None
     try:
         await peer_post("/api/traffic/receiver/stop", {})
