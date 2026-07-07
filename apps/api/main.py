@@ -658,11 +658,10 @@ async def sender_loop() -> None:
         async with traffic_lock:
             elapsed = max(0.05, now - float(traffic_state["last_tick"]))
             traffic_state["last_tick"] = now
-            ready = max(1, int(traffic_state["ready_replicas"]))
             workers = max(1, int(traffic_state["desired_replicas"]))
             produced = float(traffic_state["target_tps"]) * elapsed / workers
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) + produced)
-            send_capacity = ready * SENDER_CAPACITY_PER_POD * elapsed
+            send_capacity = SENDER_CAPACITY_PER_POD * elapsed
             tick_limit = max(1000, HPA_MAX_REPLICAS * SENDER_CAPACITY_PER_POD)
             send_units = int(min(float(traffic_state["queue_depth"]), send_capacity, tick_limit))
             traffic_state["queue_depth"] = max(0.0, float(traffic_state["queue_depth"]) - send_units)
