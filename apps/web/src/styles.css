@@ -1,0 +1,60 @@
+:root {
+  --bg: #111316;
+  --surface: #1b1f23;
+  --surface-2: #242a30;
+  --line: #343b44;
+  --text: #eef2f4;
+  --muted: #98a3ad;
+  --green: #4ade80;
+  --amber: #f5b84b;
+  --red: #f06455;
+  --blue: #60a5fa;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--text); background: radial-gradient(circle at 20% 0%, #273c33 0, transparent 32%), var(--bg); }
+button { font: inherit; }
+.shell { width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0; }
+.hero { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; margin-bottom: 24px; }
+.label { color: var(--green); font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; margin: 0 0 8px; }
+h1 { margin: 0; font-size: clamp(36px, 7vw, 76px); line-height: .92; letter-spacing: -0.04em; }
+.copy { color: var(--muted); max-width: 650px; line-height: 1.6; margin: 16px 0 0; }
+.version { min-width: 220px; border: 1px solid var(--line); background: rgb(27 31 35 / .78); border-radius: 8px; padding: 14px; display: grid; gap: 6px; }
+.version span { color: var(--muted); font-size: 12px; }
+.version strong { color: var(--green); overflow-wrap: anywhere; }
+.grid { display: grid; grid-template-columns: 1fr 1.15fr; gap: 16px; align-items: stretch; }
+.panel { border: 1px solid var(--line); background: rgb(27 31 35 / .86); border-radius: 8px; padding: 18px; box-shadow: 0 18px 50px rgb(0 0 0 / .24); }
+.panel-title { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 14px; }
+.panel-title span { color: var(--muted); font-size: 12px; text-align: right; }
+.buttons { display: grid; gap: 10px; }
+.buttons button, .primary { cursor: pointer; color: var(--text); border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 11px 12px; text-align: left; transition: transform .16s ease, border-color .16s ease, background .16s ease; }
+.buttons button:hover, .primary:hover { transform: translateY(-1px); border-color: var(--green); }
+.buttons button span { display: block; font-weight: 800; margin-bottom: 4px; }
+.buttons button small { display: block; color: var(--muted); line-height: 1.35; }
+.primary { width: 100%; margin-top: 12px; text-align: center; background: var(--green); color: #07140d; border-color: transparent; font-weight: 900; }
+.live { min-height: 440px; }
+.heat { --heat: 0; display: grid; grid-template-columns: repeat(9, 1fr); gap: 8px; height: 260px; }
+.heat span { border-radius: 5px; background: color-mix(in oklab, var(--green) calc((1 - var(--heat)) * 100%), var(--red) calc(var(--heat) * 100%)); opacity: calc(.45 + var(--heat) * .55); animation: cellPulse 1.2s ease-in-out infinite; }
+@keyframes cellPulse { 50% { transform: scale(calc(.96 + var(--heat) * .05)); filter: brightness(calc(1 + var(--heat) * .55)); } }
+.pipeline { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 18px; }
+.pipeline div { position: relative; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 10px; text-align: center; font-size: 12px; overflow: hidden; }
+.pipeline div::after { content: ""; position: absolute; inset: auto 0 0; height: 3px; background: var(--green); transform: translateX(-100%); animation: flow 1.4s linear infinite; }
+.pipeline div.hot { color: var(--text); border-color: var(--amber); }
+.pipeline div.hot::after { background: var(--amber); }
+@keyframes flow { to { transform: translateX(100%); } }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0; }
+.metric { border: 1px solid var(--line); background: rgb(36 42 48 / .82); border-radius: 8px; padding: 15px; }
+.metric span { color: var(--muted); font-size: 12px; }
+.metric strong { display: block; font-size: 30px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.rows { display: grid; gap: 8px; max-height: 300px; overflow: auto; }
+.rows div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 9px 0; }
+.rows b { font-size: 13px; }
+.rows span { color: var(--muted); font-size: 12px; text-align: right; }
+@media (max-width: 860px) {
+  .hero, .grid, .split { grid-template-columns: 1fr; display: grid; }
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+  .version { width: 100%; }
+}
+
