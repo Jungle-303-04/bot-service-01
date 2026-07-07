@@ -770,6 +770,11 @@ async def traffic_snapshot(cluster: dict[str, Any]) -> dict[str, Any]:
         state["failed_per_second"] = failed_per_second
         state["pod_stats"] = pod_stats
         state["queue_depth"] = max(float(state.get("queue_depth") or 0), produced - sent_total)
+    else:
+        state["sent_per_second"] = 0
+        state["accepted_per_second"] = 0
+        state["failed_per_second"] = 0
+        state["pod_stats"] = {}
     queue_depth = float(state.get("queue_depth") or 0)
     pressure = min(1.0, queue_depth / max(ready * SENDER_CAPACITY_PER_POD * 2, 1))
     return {
@@ -953,6 +958,9 @@ async def status() -> dict[str, Any]:
                     "target_tps": 0,
                     "queue_depth": 0.0,
                     "peer_queue_depth": 0.0,
+                    "sent_per_second": 0,
+                    "accepted_per_second": 0,
+                    "failed_per_second": 0,
                     "updated_at": utc_now(),
                 })
                 await save_traffic_runtime(dict(traffic_state))
@@ -1211,6 +1219,9 @@ async def stop_link_traffic() -> dict[str, Any]:
             "target_tps": 0,
             "queue_depth": 0.0,
             "peer_queue_depth": 0.0,
+            "sent_per_second": 0,
+            "accepted_per_second": 0,
+            "failed_per_second": 0,
             "updated_at": utc_now(),
         })
         runtime_payload = dict(traffic_state)
@@ -1399,6 +1410,9 @@ async def recover() -> dict[str, Any]:
             "target_tps": 0,
             "queue_depth": 0.0,
             "peer_queue_depth": 0.0,
+            "sent_per_second": 0,
+            "accepted_per_second": 0,
+            "failed_per_second": 0,
             "updated_at": utc_now(),
         })
         runtime_payload = dict(traffic_state)
