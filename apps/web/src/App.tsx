@@ -58,8 +58,8 @@ function formatCount(value: number) {
 
 function formatTileRate(value: number) {
   const rounded = Math.round(value || 0);
-  if (rounded >= 1000) return `${(rounded / 1000).toFixed(rounded >= 10000 ? 0 : 1)}k/s`;
-  return `${rounded}/s`;
+  if (rounded >= 1000) return `${(rounded / 1000).toFixed(rounded >= 10000 ? 0 : 1)}k`;
+  return `${rounded}`;
 }
 
 function formatTileQueue(value: number) {
@@ -130,13 +130,16 @@ function tileStyle(box: PodBox, pressure: number) {
   } as CSSProperties;
 }
 
-function useSmoothNumber(target: number, unitsPerSecond: number) {
+function useSmoothNumber(target: number, unitsPerSecond: number, snap = false) {
   const targetRef = useRef(target);
+  const snapRef = useRef(snap);
   const [value, setValue] = useState(target);
 
   useEffect(() => {
     targetRef.current = target;
-  }, [target]);
+    snapRef.current = snap;
+    if (snap) setValue(target);
+  }, [target, snap]);
 
   useEffect(() => {
     let frame = 0;
@@ -145,6 +148,7 @@ function useSmoothNumber(target: number, unitsPerSecond: number) {
       const elapsed = Math.min(0.05, Math.max(0, (now - previous) / 1000));
       previous = now;
       setValue((current) => {
+        if (snapRef.current) return targetRef.current;
         return moveToward(current, targetRef.current, unitsPerSecond * elapsed);
       });
       frame = window.requestAnimationFrame(tick);
@@ -156,13 +160,16 @@ function useSmoothNumber(target: number, unitsPerSecond: number) {
   return value;
 }
 
-function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>) {
+function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>, snap = false) {
   const targetsRef = useRef(targets);
+  const snapRef = useRef(snap);
   const [value, setValue] = useState(targets);
 
   useEffect(() => {
     targetsRef.current = targets;
-  }, [targets]);
+    snapRef.current = snap;
+    if (snap) setValue(targets);
+  }, [targets, snap]);
 
   useEffect(() => {
     let frame = 0;
@@ -171,6 +178,7 @@ function useSmoothPods(targets: Array<Omit<PodBox, 'x' | 'y' | 'w' | 'h'>>) {
       const elapsed = Math.min(0.05, Math.max(0, (now - previous) / 1000));
       previous = now;
       setValue((current) => {
+        if (snapRef.current) return targetsRef.current;
         const currentByName = new Map(current.map((item) => [item.name, item]));
         return targetsRef.current.map((target) => {
           const currentItem = currentByName.get(target.name);
@@ -223,8 +231,9 @@ export default function App() {
   const ready = cluster?.ready_replicas ?? 0;
   const desired = cluster?.desired_replicas ?? 1;
   const pressure = traffic?.pressure ?? 0;
-  const smoothTps = useSmoothNumber(traffic?.sent_per_second ?? 0, 36000);
-  const smoothQueue = useSmoothNumber(traffic?.queue_depth ?? 0, 120000);
+  const snapStopped = !running && (traffic?.target_tps ?? 0) === 0;
+  const smoothTps = useSmoothNumber(traffic?.sent_per_second ?? 0, 36000, snapStopped);
+  const smoothQueue = useSmoothNumber(traffic?.queue_depth ?? 0, 120000, snapStopped);
 
   const rawPods = useMemo(() => {
     const actual = [...(cluster?.pods ?? [])].sort((left, right) => {
@@ -254,7 +263,7 @@ export default function App() {
     });
   }, [cluster, traffic?.pod_stats]);
 
-  const pods = useSmoothPods(rawPods);
+  const pods = useSmoothPods(rawPods, snapStopped);
   const boxes = useMemo(() => splitBoxes(pods), [pods]);
 
   const start = async () => {
@@ -273,6 +282,26 @@ export default function App() {
   const stop = async () => {
     setBusy('stop');
     try {
+      setStatus((current) => current ? {
+        ...current,
+        cluster: {
+          ...current.cluster,
+          desired_replicas: 1,
+          ready_replicas: Math.min(current.cluster.ready_replicas, 1),
+          pods: current.cluster.pods.slice(0, 1),
+        },
+        traffic: {
+          ...current.traffic,
+          running: false,
+          target_tps: 0,
+          queue_depth: 0,
+          sent_per_second: 0,
+          peer_ready_replicas: 0,
+          peer_desired_replicas: 0,
+          pressure: 0,
+          pod_stats: {},
+        },
+      } : current);
       await api('/api/traffic/stop', { method: 'POST' });
       await refresh();
     } finally {
@@ -304,7 +333,7 @@ export default function App() {
       </section>
 
       <section className="metrics">
-        <Metric label="TPS" value={`${formatCount(smoothTps)}/s`} />
+        <Metric label="TPS" value={formatCount(smoothTps)} />
         <Metric label="대기" value={formatCount(smoothQueue)} tone={pressure > 0.72 ? 'bad' : pressure > 0.35 ? 'warn' : 'ok'} />
         <Metric label="Pod" value={`${ready} / ${desired}`} />
       </section>

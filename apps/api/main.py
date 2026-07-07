@@ -1223,6 +1223,7 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
 
 @app.post("/api/traffic/stop")
 async def stop_link_traffic() -> dict[str, Any]:
+    global traffic_task
     await set_scenario("traffic_link", False)
     async with traffic_lock:
         traffic_state.update({
@@ -1237,6 +1238,14 @@ async def stop_link_traffic() -> dict[str, Any]:
         })
         runtime_payload = dict(traffic_state)
     await save_traffic_runtime(runtime_payload)
+    task = traffic_task
+    traffic_task = None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=0.5)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
     peer_error = None
     try:
         await peer_post("/api/traffic/receiver/stop", {})
