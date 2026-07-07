@@ -956,7 +956,8 @@ async def metrics() -> Response:
 
 
 @app.get("/api/status")
-async def status() -> dict[str, Any]:
+async def status(response: Response) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
     scenarios = await sync_scenarios_from_db(force=True)
     if scenarios.get("traffic_link", False):
         await ensure_sender_from_runtime(scenarios)
