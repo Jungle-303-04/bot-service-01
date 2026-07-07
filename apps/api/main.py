@@ -1204,7 +1204,7 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
 
     started_at = utc_now()
     async with traffic_lock:
-        generation = int(traffic_state.get("generation") or 0) + 1
+        generation = time.time_ns()
         traffic_state.update({
             "running": True,
             "generation": generation,
@@ -1246,7 +1246,7 @@ async def start_link_traffic(request: Request) -> dict[str, Any]:
 async def stop_link_traffic() -> dict[str, Any]:
     global traffic_task
     async with traffic_lock:
-        generation = int(traffic_state.get("generation") or 0) + 1
+        generation = time.time_ns()
         run_id = str(traffic_state.get("run_id") or "")
         traffic_state.update({
             "running": False,
